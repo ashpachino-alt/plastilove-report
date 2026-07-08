@@ -159,7 +159,7 @@ def fetch_ozon_transactions(date_from: str, date_to: str, out: Path):
 def fetch_ozon_transaction_totals(date_from: str, date_to: str, out: Path):
     """POST /v3/finance/transaction/totals — сверка."""
     log("OZON: transaction/totals")
-    from datetime import date, timedelta, calendar as cal
+    from datetime import date, timedelta
     import calendar
 
     d_from = date.fromisoformat(date_from)
