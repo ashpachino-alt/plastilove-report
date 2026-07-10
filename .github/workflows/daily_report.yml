@@ -2,7 +2,7 @@ name: Ежедневный отчёт PlastiLove
 
 on:
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "23 6 * * *"
   workflow_dispatch:
 
 jobs:
