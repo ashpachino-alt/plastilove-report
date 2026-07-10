@@ -48,7 +48,12 @@ def run_fetch(date_from: str, date_to: str, out: Path):
     print(f"[daily] fetch {date_from} → {date_to} → {out}")
     cmd = [sys.executable, str(BASE / "fetch.py"),
            "--from", date_from, "--to", date_to, "--out", str(out)]
-    subprocess.run(cmd, check=True)
+    # НЕ роняем весь пайплайн, если fetch вернул ненулевой код:
+    # отчёт всё равно соберётся, если критичные файлы (транзакции Ozon,
+    # реализация WB) успели скачаться. Ниже compute сам проверит наличие данных.
+    r = subprocess.run(cmd, check=False)
+    if r.returncode != 0:
+        print(f"[daily] ⚠️ fetch завершился с кодом {r.returncode} — считаю по тому, что успело скачаться")
 
 
 def main():
@@ -83,11 +88,11 @@ def main():
 
     # 3) EXCEL → reports/<period>/
     xlsx_path = BASE / X.out_path_for(period)
-    X.build(res, period, xlsx_path)
+    X.build(res, period, xlsx_path, asof=d_to)
     print(f"[daily] Excel: {xlsx_path}")
 
     # 4) TELEGRAM
-    msg = R.build_message(res, period)
+    msg = R.build_message(res, period, asof=d_to)
     if args.no_send:
         print("─── превью (не отправлено) ───")
         print(msg)

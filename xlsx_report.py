@@ -61,9 +61,14 @@ def _section(ws, r, title, fill=SUB_FILL):
     return r + 1
 
 
-def build(res: dict, period: str, out_path: Path):
+def build(res: dict, period: str, out_path: Path, asof: str = None):
     y, m = map(int, period.split("-"))
     title = f"{RU_MONTHS[m]} {y}"
+    if asof:
+        ay, am, ad = map(int, asof.split("-"))
+        asof_txt = f"  ·  данные за 01.{am:02d}–{ad:02d}.{am:02d}.{ay}"
+    else:
+        asof_txt = ""
     oz, wb, t = res["ozon"], res["wb"], res["total"]
     final = res["params"]["final"]
 
@@ -82,7 +87,7 @@ def build(res: dict, period: str, out_path: Path):
     ws.row_dimensions[1].height = 30
     ws.merge_cells("A2:B2")
     status = "ФИНАЛЬНЫЙ (с хвостом, KPI в команде)" if final else "ПРЕДВАРИТЕЛЬНЫЙ / ОПЕРАТИВНЫЙ"
-    s = ws.cell(2, 1, f"Статус: {status}")
+    s = ws.cell(2, 1, f"Статус: {status}{asof_txt}")
     s.font = Font(italic=True, color="808080"); s.alignment = Alignment(horizontal="center")
 
     r = 4

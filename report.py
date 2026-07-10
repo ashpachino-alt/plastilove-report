@@ -29,16 +29,29 @@ def _f(x):
     return f"{round(x):,}".replace(",", " ")
 
 
-def build_message(res: dict, period: str) -> str:
+def build_message(res: dict, period: str, asof: str = None) -> str:
+    from datetime import datetime, timezone, timedelta
     y, m = map(int, period.split("-"))
     title = f"{RU_MONTHS[m]} {y}"
     oz, wb, t = res["ozon"], res["wb"], res["total"]
     final = res["params"]["final"]
     status = "✅ финальный" if final else "🟡 предварительный"
 
+    # Дата отчёта: период (1-е число → asof) и момент формирования (МСК)
+    msk = timezone(timedelta(hours=3))
+    now_msk = datetime.now(msk)
+    if asof:
+        ay, am, ad = map(int, asof.split("-"))
+        period_line = f"📅 Данные за {1:02d}.{am:02d}–{ad:02d}.{am:02d}.{ay}"
+    else:
+        period_line = f"📅 Данные за {title}"
+    gen_line = f"🕘 Сформирован: {now_msk:%d.%m.%Y %H:%M} МСК"
+
     L = []
     L.append(f"📊 <b>Отчёт PlastiLove — {title}</b>")
     L.append(f"<i>{status}</i>")
+    L.append(period_line)
+    L.append(gen_line)
     L.append("")
 
     # Итог первым делом — деньги владельца
@@ -118,10 +131,12 @@ def main():
     ap.add_argument("--final", action="store_true")
     ap.add_argument("--send", action="store_true", help="Отправить в Telegram (иначе только печать)")
     ap.add_argument("--xlsx", help="Приложить Excel-файл к сообщению")
+    ap.add_argument("--asof", help="Дата данных YYYY-MM-DD (по умолчанию сегодня)")
     args = ap.parse_args()
 
+    asof = args.asof or __import__("datetime").date.today().isoformat()
     res = C.compute_all(args.raw, cost=args.cost, cross_dock=args.cross_dock, final=args.final)
-    msg = build_message(res, args.period)
+    msg = build_message(res, args.period, asof=asof)
 
     if args.send:
         send_telegram(msg, Path(args.xlsx) if args.xlsx else None)

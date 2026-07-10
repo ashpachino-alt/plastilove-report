@@ -71,8 +71,10 @@ def wb_get(url: str, token: str, params: dict = None, pause: bool = True) -> lis
         log("  (пауза 61 сек — WB rate limit)")
         time.sleep(61)
     r = requests.get(url, headers={"Authorization": token}, params=params, timeout=120)
-    if r.status_code == 429:
-        log("  WB 429 Too Many Requests — ждём 61 сек и повторяем")
+    for attempt in range(4):
+        if r.status_code != 429:
+            break
+        log(f"  WB 429 Too Many Requests — ждём 61 сек и повторяем (попытка {attempt + 1}/4)")
         time.sleep(61)
         r = requests.get(url, headers={"Authorization": token}, params=params, timeout=120)
     r.raise_for_status()
@@ -548,32 +550,42 @@ def main():
 
     skip = set(args.skip)
 
+    # Устойчивость: ошибка одного источника НЕ роняет весь сбор.
+    # Критичные источники (транзакции Ozon, реализация WB) нужны для расчёта —
+    # остальное best-effort. Отчёт соберётся даже если что-то отвалилось.
+    def safe(name, fn, *a):
+        try:
+            fn(*a)
+        except Exception as e:
+            log(f"  ⚠️ источник '{name}' пропущен из-за ошибки: {e}")
+            MANIFEST[name] = {"error": str(e)}
+
     # ── OZON ──
     log("━━━ OZON ━━━")
-    fetch_ozon_transactions(args.date_from, args.date_to, out)
-    fetch_ozon_transaction_totals(args.date_from, args.date_to, out)
+    safe("ozon_finance", fetch_ozon_transactions, args.date_from, args.date_to, out)
+    safe("ozon_totals", fetch_ozon_transaction_totals, args.date_from, args.date_to, out)
 
     if "ozon_fbo" not in skip:
-        fetch_ozon_fbo(args.date_from, args.date_to, out)
+        safe("ozon_postings_fbo", fetch_ozon_fbo, args.date_from, args.date_to, out)
     if "ozon_fbs" not in skip:
-        fetch_ozon_fbs(args.date_from, args.date_to, out)
+        safe("ozon_postings_fbs", fetch_ozon_fbs, args.date_from, args.date_to, out)
     if "ozon_returns" not in skip:
-        fetch_ozon_returns(out)
+        safe("ozon_returns", fetch_ozon_returns, out)
 
-    fetch_ozon_stocks(out)
+    safe("ozon_stocks", fetch_ozon_stocks, out)
 
     # ── WB ──
     print()
     log("━━━ WB ━━━")
-    fetch_wb_sales(args.date_from, out)
-    fetch_wb_orders(args.date_from, out)
-    fetch_wb_report_detail(args.date_from, args.date_to, out)
-    fetch_wb_stocks(args.date_from, out)
+    safe("wb_sales", fetch_wb_sales, args.date_from, out)
+    safe("wb_orders", fetch_wb_orders, args.date_from, out)
+    safe("wb_report", fetch_wb_report_detail, args.date_from, args.date_to, out)
+    safe("wb_stocks", fetch_wb_stocks, args.date_from, out)
 
     if "wb_adv" not in skip:
-        fetch_wb_adv(args.date_from, args.date_to, out)
+        safe("wb_adv", fetch_wb_adv, args.date_from, args.date_to, out)
     if "wb_funnel" not in skip:
-        fetch_wb_funnel(args.date_from, args.date_to, out)
+        safe("wb_funnel", fetch_wb_funnel, args.date_from, args.date_to, out)
 
     # ── Манифест ──
     print()
