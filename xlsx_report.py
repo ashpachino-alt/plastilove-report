@@ -123,7 +123,6 @@ def build(res: dict, period: str, out_path: Path, asof: str = None):
         r = _row(ws, r, "− Налог 7%", -wb["tax"])
         r = _row(ws, r, "− Завод (себестоимость)", -wb["factory"])
         r = _row(ws, r, "− Упаковка", -wb["pack"])
-        r = _row(ws, r, "− Ассистент WB", -wb["assistant"])
         cd_lbl = "− Кросс-докинг (НЕ ПЕРЕДАН)" if wb["cross_dock_missing"] else "− Кросс-докинг"
         r = _row(ws, r, cd_lbl, -wb["cross_dock"])
         r = _row(ws, r, "= Остаток владельца WB", wb["owner"], fill=OWNER_FILL, bold=True, neg_red=True)
