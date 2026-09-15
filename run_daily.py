@@ -44,10 +44,12 @@ def month_bounds(period: str | None):
     return f"{y:04d}-{m:02d}", d_from.isoformat(), d_to.isoformat()
 
 
-def run_fetch(date_from: str, date_to: str, out: Path):
+def run_fetch(date_from: str, date_to: str, out: Path, skip: list[str] | None = None):
     print(f"[daily] fetch {date_from} → {date_to} → {out}")
     cmd = [sys.executable, str(BASE / "fetch.py"),
            "--from", date_from, "--to", date_to, "--out", str(out)]
+    if skip:
+        cmd += ["--skip", *skip]
     # НЕ роняем весь пайплайн, если fetch вернул ненулевой код:
     # отчёт всё равно соберётся, если критичные файлы (транзакции Ozon,
     # реализация WB) успели скачаться. Ниже compute сам проверит наличие данных.
@@ -65,6 +67,8 @@ def main():
     ap.add_argument("--final", action="store_true")
     ap.add_argument("--skip-fetch", action="store_true", help="Не тянуть сырьё заново")
     ap.add_argument("--no-send", action="store_true", help="Не отправлять в Telegram (тест)")
+    ap.add_argument("--skip", nargs="*", default=[],
+                    help="Источники для пропуска в fetch.py (напр. wb_sales wb_orders wb_report wb_stocks)")
     args = ap.parse_args()
 
     import os
@@ -78,7 +82,7 @@ def main():
 
     # 1) FETCH
     if not args.skip_fetch:
-        run_fetch(d_from, d_to, raw)
+        run_fetch(d_from, d_to, raw, skip=args.skip)
     else:
         print(f"[daily] fetch пропущен, считаю по {raw}")
 

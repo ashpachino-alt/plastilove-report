@@ -60,8 +60,30 @@ def ozon_post(endpoint: str, body: dict) -> dict:
         json=body,
         timeout=60,
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        # requests.raise_for_status() прячет тело ответа — а у Ozon именно в теле
+        # обычно лежит понятная причина (например "code":3, "message":"..."),
+        # без него 400/404 ничего не говорят о том, что чинить.
+        raise RuntimeError(f"{r.status_code} {endpoint}: {r.text[:1500]}")
     return r.json()
+
+
+def _wb_retry_wait(r, default=61) -> int:
+    """
+    WB на 429 сама говорит, сколько ждать (заголовок X-Ratelimit-Retry,
+    иногда Retry-After) — используем это значение вместо угаданных 61 сек:
+    если бакет реально опустел раньше (например, от параллельного скрипта/
+    скилла, использующего тот же токен), фиксированная пауза может
+    оказаться короче настоящего окна и все 4 попытки уйдут в те же 429.
+    """
+    for h in ("X-Ratelimit-Retry", "Retry-After"):
+        v = r.headers.get(h)
+        if v:
+            try:
+                return max(int(float(v)), 1)
+            except ValueError:
+                pass
+    return default
 
 
 def wb_get(url: str, token: str, params: dict = None, pause: bool = True) -> list | dict:
@@ -74,8 +96,9 @@ def wb_get(url: str, token: str, params: dict = None, pause: bool = True) -> lis
     for attempt in range(4):
         if r.status_code != 429:
             break
-        log(f"  WB 429 Too Many Requests — ждём 61 сек и повторяем (попытка {attempt + 1}/4)")
-        time.sleep(61)
+        wait = _wb_retry_wait(r)
+        log(f"  WB 429 Too Many Requests (X-Ratelimit-Retry={r.headers.get('X-Ratelimit-Retry')!r}) — ждём {wait} сек и повторяем (попытка {attempt + 1}/4)")
+        time.sleep(wait)
         r = requests.get(url, headers={"Authorization": token}, params=params, timeout=120)
     r.raise_for_status()
     return r.json()
@@ -133,59 +156,87 @@ def _extract_ozon_ops(data):
 
 def fetch_ozon_finance(date_from: str, date_to: str, out: Path):
     """
-    POST /v1/finance/cash-flow-statement/list — начисления и движение денег.
+    Начисления и движение денег Ozon.
 
     ⚠️ ВАЖНО: раньше здесь использовались /v3/finance/transaction/list и
     /v3/finance/transaction/totals. Ozon отключил оба метода 08.09.2026
     (анонс в @OzonSellerAPI, см. https://dev.ozon.ru/news/699-Novye-metody-dlia-finansovykh-otchetov-v-Seller-API/).
     Именно это — а не переход продавца на FBO — было причиной нулевых отчётов
-    в сентябре 2026: /v3/finance/transaction/list с этой даты возвращает ошибку,
-    fetch падал, ozon_transactions.json оставался пустым, и весь расчёт уходил в 0.
+    в сентябре 2026.
 
-    Новый метод пока официально не задокументирован в открытом доступе,
-    поэтому распаковка ответа сделана максимально гибко (_extract_ozon_ops).
-    Если Ozon снова поменяет форму ответа — в логе будут видны сырые
-    верхнеуровневые ключи первой же "непонятной" страницы.
+    Первая попытка замены (/v1/finance/cash-flow-statement/list, тело
+    {"date":{"from","to"},"with_details":true,"page","page_size"} — как в
+    неофициальном ozon-mcp-server) вернула 400 Bad Request 15.09.2026 —
+    точная форма запроса этого метода нигде официально не задокументирована,
+    и чужая реализация угадала её неверно (или метод с тех пор поменялся).
+
+    Поэтому здесь — НЕ один жёстко зашитый запрос, а перебор кандидатов
+    (эндпоинт + тело) по порядку убывания вероятности правильности:
+    1) POST /v1/finance/accrual/postings — официально анонсированная замена
+       для начислений по отправлениям (нужна именно она — только она может
+       дать разбивку по posting_number для FBO/FBS).
+    2) POST /v1/finance/accrual/by-day — тоже официально анонсирован,
+       но это агрегат по дню БЕЗ отправлений: разбивку по FBO/FBS он дать
+       не может, зато формат его тела ({"date":"YYYY-MM-DD"}) подтверждён
+       рабочей реализацией (ozon-mcp-server), поэтому это надёжный
+       запасной вариант если (1) продолжит не работать.
+    Для КАЖДОЙ попытки в лог пишется код ответа и ПОЛНОЕ тело (обрезано до
+    2000 симв.) — и при успехе, и при ошибке. Так при следующей неудаче
+    сразу видно точную причину и реальную форму ответа, без гаданий.
     """
-    log("OZON: движение денег / начисления (cash-flow-statement)")
     from datetime import date, timedelta
-    import calendar
 
     d_from = date.fromisoformat(date_from)
     d_to   = date.fromisoformat(date_to)
+    days = [d_from + timedelta(days=i) for i in range((d_to - d_from).days + 1)]
 
+    log("OZON: начисления — пробуем /v1/finance/accrual/postings")
     all_ops = []
-    chunk_start = d_from
-    while chunk_start <= d_to:
-        last_day = calendar.monthrange(chunk_start.year, chunk_start.month)[1]
-        chunk_end = min(date(chunk_start.year, chunk_start.month, last_day), d_to)
-        cf = chunk_start.isoformat()
-        ct = chunk_end.isoformat()
-        log(f"  чанк {cf} — {ct}")
-
+    postings_ok = True
+    try:
         page = 1
         while True:
-            data = ozon_post("/v1/finance/cash-flow-statement/list", {
-                "date": {"from": cf, "to": ct},
-                "with_details": True,
+            body = {
+                "filter": {"date": {"from": date_from, "to": date_to}},
                 "page": page,
                 "page_size": 1000,
-            })
+            }
+            data = ozon_post("/v1/finance/accrual/postings", body)
+            log(f"  стр {page} — сырой ответ (обрезан 2000): {json.dumps(data, ensure_ascii=False)[:2000]}")
             ops = _extract_ozon_ops(data)
-            if ops is None:
-                keys = list(data.keys()) if isinstance(data, dict) else str(type(data))
-                log(f"  ⚠️ стр {page}: не нашёл список операций в ответе — верхнеуровневые ключи: {keys}")
-                log(f"     сырой ответ (обрезан): {str(data)[:500]}")
-                break
             if not ops:
                 break
             all_ops.extend(ops)
-            log(f"    стр {page}: +{len(ops)}, всего: {len(all_ops)}")
+            log(f"    +{len(ops)}, всего: {len(all_ops)}")
             if len(ops) < 1000:
                 break
             page += 1
+    except Exception as e:
+        log(f"  ⚠️ accrual/postings не сработал: {e}")
+        postings_ok = False
+        all_ops = []
 
-        chunk_start = chunk_end + timedelta(days=1)
+    source = "accrual_postings"
+    if not postings_ok or not all_ops:
+        log("OZON: пробуем запасной вариант /v1/finance/accrual/by-day (день за днём, без разбивки по отправлениям)")
+        source = "accrual_by_day"
+        all_ops = []
+        logged_sample = False
+        for i, d in enumerate(days):
+            ds = d.isoformat()
+            try:
+                data = ozon_post("/v1/finance/accrual/by-day", {"date": ds})
+            except Exception as e:
+                log(f"  ⚠️ {ds}: {e}")
+                continue
+            if not logged_sample:
+                log(f"  сырой ответ за {ds} (обрезан 2000): {json.dumps(data, ensure_ascii=False)[:2000]}")
+                logged_sample = True
+            # Не знаем заранее форму — сохраняем сырой ответ как есть,
+            # с добавленной датой, чтобы компьют мог агрегировать хоть что-то.
+            rec = data if isinstance(data, dict) else {"raw": data}
+            rec["_date"] = ds
+            all_ops.append(rec)
 
     path = save(out, "ozon_finance_operations.json", all_ops)
     total_amount = sum((op.get("amount") or op.get("sum") or 0) for op in all_ops if isinstance(op, dict))
@@ -195,10 +246,11 @@ def fetch_ozon_finance(date_from: str, date_to: str, out: Path):
         "size_bytes": path.stat().st_size,
         "operations_count": len(all_ops),
         "total_amount": round(total_amount, 2),
+        "source": source,
     }
-    log(f"  Итого: {len(all_ops)} операций, сумма≈{total_amount:,.2f} ₽")
+    log(f"  Итого ({source}): {len(all_ops)} записей, сумма(эвристика)≈{total_amount:,.2f} ₽")
     if not all_ops:
-        log("  ⚠️ операций 0 — либо за период правда нет начислений, либо см. предупреждения выше по форме ответа")
+        log("  ⚠️ записей 0 — оба метода не дали данных, см. ⚠️ выше по каждому")
 
 
 def fetch_ozon_realization(month: int, year: int, out: Path):
@@ -614,10 +666,14 @@ def main():
     # ── WB ──
     print()
     log("━━━ WB ━━━")
-    safe("wb_sales", fetch_wb_sales, args.date_from, out)
-    safe("wb_orders", fetch_wb_orders, args.date_from, out)
-    safe("wb_report", fetch_wb_report_detail, args.date_from, args.date_to, out)
-    safe("wb_stocks", fetch_wb_stocks, args.date_from, out)
+    if "wb_sales" not in skip:
+        safe("wb_sales", fetch_wb_sales, args.date_from, out)
+    if "wb_orders" not in skip:
+        safe("wb_orders", fetch_wb_orders, args.date_from, out)
+    if "wb_report" not in skip:
+        safe("wb_report", fetch_wb_report_detail, args.date_from, args.date_to, out)
+    if "wb_stocks" not in skip:
+        safe("wb_stocks", fetch_wb_stocks, args.date_from, out)
 
     if "wb_adv" not in skip:
         safe("wb_adv", fetch_wb_adv, args.date_from, args.date_to, out)
