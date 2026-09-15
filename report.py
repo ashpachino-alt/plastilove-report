@@ -70,6 +70,13 @@ def build_message(res: dict, period: str, asof: str = None) -> str:
         kpi = oz["kpi"]["total"]
         kpi_word = "в команде" if final else "резерв"
         L.append(f"• команда {_f(oz['team'])} (KPI {kpi_word}: {_f(kpi)} ₽)")
+        by_scheme = oz.get("by_scheme") or {}
+        if len(by_scheme) > 1:
+            L.append("• по схемам:")
+            for scheme, d in by_scheme.items():
+                L.append(f"   ⁃ {scheme}: {d['net_units']} шт · продажи {_f(d['net_sales'])} · выплаты {_f(d['payout'])} · опт {d['opt']:.0f} ₽/шт")
+        if oz.get("unmatched_note"):
+            L.append(f"• ⚠️ {oz['unmatched_note']}")
         L.append("")
 
     # WB
@@ -80,6 +87,11 @@ def build_message(res: dict, period: str, asof: str = None) -> str:
         L.append(f"• выплаты {_f(wb['payout'])} · реклама −{_f(wb['adv'])}")
         d = wb["deductions"]
         L.append(f"• логистика −{_f(d['logistics'])} · хранение −{_f(d['storage'])}")
+        wb_by_scheme = wb.get("by_scheme") or {}
+        if wb.get("scheme_split_available") and len(wb_by_scheme) > 1:
+            L.append("• по схемам (продажи/штуки, без разбивки удержаний):")
+            for scheme, ds in wb_by_scheme.items():
+                L.append(f"   ⁃ {scheme}: {ds['net_units']} шт · продажи {_f(ds['sales_rub'])} ₽")
         if wb["cross_dock_missing"]:
             L.append("• ⚠️ кросс-докинг не передан (в расчёте 0)")
         L.append("")

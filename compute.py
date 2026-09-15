@@ -10,6 +10,27 @@ compute.py — расчёт управленческой юнит-экономи
   python compute.py --raw ./raw/2026-06 --json out.json   # результат в JSON
 
 Логика строго по инструкции проекта PlastiLove (Ozon + WB).
+
+── FBO / FBS ────────────────────────────────────────────────────────────
+С сентября 2026 Ozon отключил /v3/finance/transaction/list (см. fetch.py) —
+именно это, а не переход на FBO, было причиной нулевых отчётов. Заодно
+добавлена разбивка «сколько сделал FBO, сколько FBS» внутри каждого канала:
+
+  • Ozon — операции классифицируются по posting_number: сверяем с уже
+    скачанными списками отправлений /v2/posting/fbo/list и
+    /v3/posting/fbs/list (ozon_fbo_postings.json / ozon_fbs_postings.json).
+    Для найденных отправлений считаем полный P&L (продажи, выплаты, опт,
+    налог, завод, упаковка) отдельно по FBO и по FBS. Команда/оклад/KPI
+    считаются только на уровне канала Ozon целиком — они не привязаны
+    к конкретной поставке, поэтому делить их по схеме нечем.
+
+  • WB — операции склад-продажи классифицируются по srid через
+    warehouseType в wb_orders.json / wb_sales.json ("Склад WB" → FBO,
+    иначе — FBS/маркетплейс/DBS). Реклама, логистика, хранение и прочие
+    удержания у WB не разбиты по схеме на уровне отчёта реализации,
+    поэтому по WB показываем разбивку по выручке и штукам, а не по
+    полному P&L — это честнее, чем выдумывать точность, которой нет
+    в исходных данных.
 """
 
 import argparse
@@ -31,6 +52,8 @@ WB_ASSISTANT   = 0             # ассистент WB, ₽/мес (больше
 
 OZON_DELIVER   = "Доставка покупателю"
 OZON_RETURN    = "Получение возврата, отмены, невыкупа от покупателя"
+
+UNSCHEMED = "не определено"    # операция/продажа, которую не удалось привязать к FBO или FBS
 
 
 # ──────────────────────────────────────────────
@@ -60,14 +83,103 @@ def _load(path: Path | None):
 def load_raw(raw: Path) -> dict:
     """Возвращает словарь с исходными данными по известным источникам."""
     return {
-        "ozon_tx":     _load(_find(raw, "ozon_transactions.json", "transactions_*.json", "ozon_transactions*.json")),
+        "ozon_tx": _load(_find(
+            raw,
+            "ozon_finance_operations.json",       # новый источник (cash-flow-statement)
+            "ozon_transactions.json",              # старый источник (для архивных raw/ до сентября 2026)
+            "transactions_*.json", "ozon_transactions*.json",
+        )),
+        "ozon_fbo_postings": _load(_find(raw, "ozon_fbo_postings.json")) or [],
+        "ozon_fbs_postings": _load(_find(raw, "ozon_fbs_postings.json")) or [],
         "wb_report":   _load(_find(raw, "wb_report_detail.json", "report_detail.json", "wb_report*.json")),
         "wb_adv":      _load(_find(raw, "wb_adv.json", "adv_upd.json", "wb_adv*.json")),
+        "wb_orders":   _load(_find(raw, "wb_orders.json")) or [],
+        "wb_sales":    _load(_find(raw, "wb_sales.json")) or [],
     }
 
 
 def _sum(rows, field):
     return sum((r.get(field) or 0) for r in rows)
+
+
+def _get(d: dict, *keys, default=None):
+    """
+    Достаёт значение по первому найденному ключу. Ключ может быть путём
+    через точку ("posting.posting_number") для вложенных словарей.
+    Нужно, т.к. точная форма ответа нового финансового API Ozon
+    (/v1/finance/cash-flow-statement/list) официально не задокументирована.
+    """
+    for k in keys:
+        cur = d
+        ok = True
+        for part in k.split("."):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                ok = False
+                break
+        if ok and cur is not None:
+            return cur
+    return default
+
+
+def _op_type_name(op: dict) -> str:
+    return _get(op, "operation_type_name", "type_name", "operation_name", default="") or ""
+
+
+def _op_amount(op: dict) -> float:
+    return _get(op, "amount", "sum", "total_amount", default=0) or 0
+
+
+def _op_accrual(op: dict) -> float:
+    return _get(op, "accruals_for_sale", "accrual_for_sale", "sale_amount", default=0) or 0
+
+
+def _op_posting_number(op: dict) -> str:
+    return _get(op, "posting.posting_number", "posting_number", default="") or ""
+
+
+def _op_delivery_schema(op: dict) -> str:
+    """
+    'FBO' / 'FBS' / 'RFBS' / 'CROSSBORDER' / '' — берём прямо из посылки.
+    Подтверждено на реальных данных (raw/2026-06/ozon_transactions.json,
+    старый /v3/finance/transaction/list): поле posting.delivery_schema
+    у Ozon действительно есть и совпадает с реальной схемой продажи.
+    Если новый /v1/finance/cash-flow-statement/list его не отдаёт —
+    ничего страшного, ниже есть запасной путь через posting_number.
+    """
+    return (_get(op, "posting.delivery_schema", "delivery_schema", default="") or "").strip().upper()
+
+
+# ──────────────────────────────────────────────
+# Классификация по схеме (FBO / FBS)
+# ──────────────────────────────────────────────
+def build_ozon_scheme_map(fbo_postings: list, fbs_postings: list) -> dict:
+    """posting_number → 'FBO' / 'FBS', по спискам отправлений из fetch.py."""
+    m = {}
+    for p in fbo_postings or []:
+        pn = p.get("posting_number")
+        if pn:
+            m[pn] = "FBO"
+    for p in fbs_postings or []:
+        pn = p.get("posting_number")
+        if pn:
+            m[pn] = "FBS"
+    return m
+
+
+def build_wb_scheme_map(wb_orders: list, wb_sales: list) -> dict:
+    """srid → 'FBO' / 'FBS', по warehouseType из заказов/продаж WB.
+    'Склад WB' (и похожие) → FBO. Всё остальное (склад продавца / DBS / маркетплейс) → FBS."""
+    m = {}
+    for rows in (wb_orders or [], wb_sales or []):
+        for r in rows:
+            srid = r.get("srid")
+            wtype = (r.get("warehouseType") or "").strip()
+            if not srid or not wtype:
+                continue
+            m[srid] = "FBO" if "WB" in wtype.upper() else "FBS"
+    return m
 
 
 # ──────────────────────────────────────────────
@@ -111,40 +223,96 @@ def ozon_kpi(net_units: int, opt: float) -> dict:
 # ──────────────────────────────────────────────
 # OZON
 # ──────────────────────────────────────────────
-def compute_ozon(tx, cost=COST_CORPUS, final=False) -> dict:
-    if not tx:
-        return {"error": "нет ozon_transactions.json"}
-    deliv = [t for t in tx if t.get("operation_type_name") == OZON_DELIVER]
-    ret   = [t for t in tx if t.get("operation_type_name") == OZON_RETURN]
+def _ozon_scheme_slice(ops: list, cost: int) -> dict:
+    """Полный P&L (без команды/KPI — они общие на канал) для подмножества операций Ozon."""
+    deliv = [t for t in ops if _op_type_name(t) == OZON_DELIVER]
+    ret   = [t for t in ops if _op_type_name(t) == OZON_RETURN]
 
-    net_units  = len(deliv) - len(ret)
-    gross      = _sum(deliv, "accruals_for_sale")
-    ret_sum    = abs(_sum(ret, "accruals_for_sale"))
-    net_sales  = gross - ret_sum
-    payout     = round(_sum(tx, "amount"), 2)                 # выплаты Ozon (нетто, реклама уже внутри)
-    opt        = payout / net_units if net_units else 0
+    net_units = len(deliv) - len(ret)
+    gross     = sum(_op_accrual(t) for t in deliv)
+    ret_sum   = abs(sum(_op_accrual(t) for t in ret))
+    net_sales = gross - ret_sum
+    payout    = round(sum(_op_amount(t) for t in ops), 2)
+    opt       = payout / net_units if net_units else 0
 
     tax     = round(net_sales * TAX_RATE, 2)
     factory = net_units * cost
     pack    = net_units * BOX_PER_UNIT
-    kpi     = ozon_kpi(net_units, opt)
-    team    = OZON_SALARY + (kpi["total"] if final else 0)     # KPI в команду только при финале
-    owner   = round(payout - tax - factory - pack - team, 2)
+    margin_before_team = round(payout - tax - factory - pack, 2)
 
     return {
-        "net_units": net_units, "gross_sales": round(gross, 2), "returns_sum": round(ret_sum, 2),
-        "net_sales": round(net_sales, 2), "payout": payout, "opt": round(opt, 2),
+        "net_units": net_units, "net_sales": round(net_sales, 2), "payout": payout,
+        "opt": round(opt, 2), "tax": tax, "factory": factory, "pack": pack,
+        "margin_before_team": margin_before_team,
+        "deliveries": len(deliv), "returns_count": len(ret),
+    }
+
+
+def compute_ozon(tx, fbo_postings=None, fbs_postings=None, cost=COST_CORPUS, final=False) -> dict:
+    if not tx:
+        return {"error": "нет данных начислений Ozon (ozon_finance_operations.json / ozon_transactions.json пуст)"}
+
+    scheme_map = build_ozon_scheme_map(fbo_postings or [], fbs_postings or [])
+
+    by_scheme_ops = defaultdict(list)
+    unmatched = 0
+    for op in tx:
+        if not isinstance(op, dict):
+            continue
+        # 1) сначала — прямое поле posting.delivery_schema (надёжнее, подтверждено на реальных данных);
+        # 2) если пусто — сверяем posting_number со списками /v2/posting/fbo/list и /v3/posting/fbs/list.
+        scheme = _op_delivery_schema(op)
+        if not scheme:
+            pn = _op_posting_number(op)
+            scheme = scheme_map.get(pn, UNSCHEMED)
+        if scheme == UNSCHEMED:
+            unmatched += 1
+        by_scheme_ops[scheme].append(op)
+
+    # ── общий расчёт по каналу (как раньше — не зависит от разбивки по схеме) ──
+    combined = _ozon_scheme_slice(tx, cost)
+    net_units, net_sales, payout, opt = (
+        combined["net_units"], combined["net_sales"], combined["payout"], combined["opt"],
+    )
+    tax, factory, pack = combined["tax"], combined["factory"], combined["pack"]
+    kpi   = ozon_kpi(net_units, opt)
+    team  = OZON_SALARY + (kpi["total"] if final else 0)     # KPI в команду только при финале
+    owner = round(payout - tax - factory - pack - team, 2)
+
+    # Порядок: FBO, FBS вперёд (основные схемы), любые другие схемы Ozon
+    # (RFBS/CROSSBORDER/FBP и т.п., если появятся) — посередине, «не определено» — последним.
+    priority = {"FBO": 0, "FBS": 1, UNSCHEMED: 99}
+    ordered_schemes = sorted(by_scheme_ops.keys(), key=lambda s: priority.get(s, 50))
+    by_scheme = {}
+    for scheme in ordered_schemes:
+        ops = by_scheme_ops.get(scheme)
+        if ops:
+            by_scheme[scheme] = _ozon_scheme_slice(ops, cost)
+
+    gross_sales = round(sum(_op_accrual(t) for t in tx if _op_type_name(t) == OZON_DELIVER), 2)
+    returns_sum = round(abs(sum(_op_accrual(t) for t in tx if _op_type_name(t) == OZON_RETURN)), 2)
+
+    return {
+        "net_units": net_units, "gross_sales": gross_sales, "returns_sum": returns_sum,
+        "net_sales": net_sales, "payout": payout, "opt": opt,
         "tax": tax, "factory": factory, "pack": pack,
         "salary": OZON_SALARY, "kpi": kpi, "kpi_in_team": final,
         "team": team, "owner": owner,
-        "deliveries": len(deliv), "returns_count": len(ret),
+        "deliveries": combined["deliveries"], "returns_count": combined["returns_count"],
+        "by_scheme": by_scheme,
+        "unmatched_ops": unmatched,
+        "unmatched_note": (
+            f"{unmatched} операций не удалось привязать к FBO/FBS по posting_number "
+            f"(нет в ozon_fbo_postings.json / ozon_fbs_postings.json за этот период)"
+            if unmatched else None
+        ),
     }
 
 
 # ──────────────────────────────────────────────
 # WB
 # ──────────────────────────────────────────────
-def compute_wb(report, adv, cost=COST_CORPUS, cross_dock=0) -> dict:
+def compute_wb(report, adv, wb_orders=None, wb_sales=None, cost=COST_CORPUS, cross_dock=0) -> dict:
     if not report:
         return {"error": "нет wb_report_detail.json"}
     byop = defaultdict(list)
@@ -173,6 +341,38 @@ def compute_wb(report, adv, cost=COST_CORPUS, cross_dock=0) -> dict:
     pack    = net_units * BOX_PER_UNIT
     owner   = round(after_adv - tax - factory - pack - WB_ASSISTANT - cross_dock, 2)
 
+    # ── разбивка по схеме (FBO/Склад WB vs FBS/маркетплейс-DBS) ──
+    # У отчёта реализации WB нет собственного поля со схемой, поэтому
+    # классифицируем по srid через warehouseType из wb_orders/wb_sales.
+    # Делим только выручку и штуки (продажи минус возвраты) — удержания
+    # (логистика/хранение/реклама/штрафы) в отчёте реализации по схеме
+    # не разложены, поэтому не делаем вид, что можем их точно поделить.
+    scheme_map = build_wb_scheme_map(wb_orders or [], wb_sales or [])
+    by_scheme_units = defaultdict(float)
+    by_scheme_sales = defaultdict(float)
+    unmatched = 0
+    if scheme_map:
+        for r in sales:
+            srid = r.get("srid")
+            scheme = scheme_map.get(srid, UNSCHEMED)
+            if scheme == UNSCHEMED:
+                unmatched += 1
+            by_scheme_units[scheme] += (r.get("quantity") or 0)
+            by_scheme_sales[scheme] += (r.get("retail_amount") or 0)
+        for r in rets:
+            srid = r.get("srid")
+            scheme = scheme_map.get(srid, UNSCHEMED)
+            by_scheme_units[scheme] -= (r.get("quantity") or 0)
+            by_scheme_sales[scheme] -= (r.get("retail_amount") or 0)
+
+    by_scheme = {}
+    for scheme in ("FBO", "FBS", UNSCHEMED):
+        if scheme in by_scheme_units:
+            by_scheme[scheme] = {
+                "net_units": int(by_scheme_units[scheme]),
+                "sales_rub": round(by_scheme_sales[scheme], 2),
+            }
+
     return {
         "net_units": net_units, "sales_rub": round(sales_rub, 2), "payout": payout,
         "adv": adv_spend, "after_adv": after_adv, "opt": round(opt, 2),
@@ -183,6 +383,9 @@ def compute_wb(report, adv, cost=COST_CORPUS, cross_dock=0) -> dict:
         "deductions": {"logistics": round(logistics, 2), "storage": round(storage, 2),
                        "deduction": round(deduction, 2), "penalty": round(penalty, 2),
                        "rebill": round(rebill, 2)},
+        "by_scheme": by_scheme,
+        "unmatched_units": unmatched if scheme_map else None,
+        "scheme_split_available": bool(scheme_map),
     }
 
 
@@ -191,8 +394,10 @@ def compute_wb(report, adv, cost=COST_CORPUS, cross_dock=0) -> dict:
 # ──────────────────────────────────────────────
 def compute_all(raw_dir, cost=COST_CORPUS, cross_dock=0, final=False) -> dict:
     raw = load_raw(Path(raw_dir))
-    oz = compute_ozon(raw["ozon_tx"], cost=cost, final=final)
-    wb = compute_wb(raw["wb_report"], raw["wb_adv"], cost=cost, cross_dock=cross_dock)
+    oz = compute_ozon(raw["ozon_tx"], raw["ozon_fbo_postings"], raw["ozon_fbs_postings"],
+                       cost=cost, final=final)
+    wb = compute_wb(raw["wb_report"], raw["wb_adv"], raw["wb_orders"], raw["wb_sales"],
+                     cost=cost, cross_dock=cross_dock)
 
     def g(d, k):
         return 0 if "error" in d else d.get(k, 0)
@@ -223,6 +428,15 @@ def _f(x):
     return f"{round(x):,}".replace(",", " ")
 
 
+def _print_scheme_block(title: str, by_scheme: dict, keys):
+    if not by_scheme or len(by_scheme) <= 1:
+        return
+    print(f"  ── по схемам ({title}) ──")
+    for scheme, d in by_scheme.items():
+        parts = [f"{k}={_f(d[k]) if isinstance(d.get(k), (int, float)) else d.get(k)}" for k in keys if k in d]
+        print(f"    {scheme}: " + " · ".join(parts))
+
+
 def print_report(res: dict):
     oz, wb, t = res["ozon"], res["wb"], res["total"]
     print("═══════════ OZON ═══════════")
@@ -238,6 +452,10 @@ def print_report(res: dict):
         print(f"  − короб:         {_f(oz['pack'])} ₽")
         print(f"  − команда:       {_f(oz['team'])} ₽  (KPI: {oz['kpi']['reason']})")
         print(f"  = владелец Ozon: {_f(oz['owner'])} ₽")
+        _print_scheme_block("Ozon", oz.get("by_scheme", {}),
+                             ("net_units", "net_sales", "payout", "opt", "margin_before_team"))
+        if oz.get("unmatched_note"):
+            print(f"    ⚠️ {oz['unmatched_note']}")
     print("═══════════ WB ═══════════")
     if "error" in wb:
         print(" ", wb["error"])
@@ -254,6 +472,11 @@ def print_report(res: dict):
         cd = "НЕ ПЕРЕДАН (0)" if wb["cross_dock_missing"] else _f(wb["cross_dock"]) + " ₽"
         print(f"  − кросс-докинг:  {cd}")
         print(f"  = владелец WB:   {_f(wb['owner'])} ₽")
+        if wb.get("scheme_split_available"):
+            _print_scheme_block("WB, только выручка/штуки", wb.get("by_scheme", {}),
+                                 ("net_units", "sales_rub"))
+        else:
+            print("  ── по схемам (WB): нет данных wb_orders.json/wb_sales.json для сопоставления по srid ──")
     print("═══════════ ИТОГ ═══════════")
     print(f"  выкупы:          {t['net_units']} шт")
     print(f"  продажи:         {_f(t['net_sales'])} ₽")

@@ -108,6 +108,19 @@ def build(res: dict, period: str, out_path: Path, asof: str = None):
         r = _row(ws, r, f"   {kpi_note}", oz["kpi"]["reason"], fmt="General", indent=2)
         r = _row(ws, r, "= Остаток владельца Ozon", oz["owner"], fill=OWNER_FILL, bold=True, neg_red=True)
 
+        by_scheme = oz.get("by_scheme") or {}
+        if len(by_scheme) > 1:
+            r += 1
+            r = _row(ws, r, "Разбивка Ozon по схеме (FBO / FBS)", "", fmt="General", bold=True, indent=0)
+            for scheme, d in by_scheme.items():
+                r = _row(ws, r, f"   {scheme} — выкупы", d["net_units"], fmt=PCS, indent=2)
+                r = _row(ws, r, f"   {scheme} — чистые продажи", d["net_sales"], indent=2)
+                r = _row(ws, r, f"   {scheme} — выплаты", d["payout"], indent=2)
+                r = _row(ws, r, f"   {scheme} — опт (₽/шт)", d["opt"], fmt=RUBUNIT, indent=2)
+                r = _row(ws, r, f"   {scheme} — маржа до команды (−налог−завод−короб)", d["margin_before_team"], indent=2, neg_red=True)
+            if oz.get("unmatched_note"):
+                r = _row(ws, r, "   ⚠️ примечание", oz["unmatched_note"], fmt="General", indent=2)
+
     r += 1
     # ── WB ──
     r = _section(ws, r, "БЛОК 2. WILDBERRIES")
@@ -130,6 +143,21 @@ def build(res: dict, period: str, out_path: Path, asof: str = None):
         r = _row(ws, r, "   в т.ч. удержания WB: логистика/хранение/пр.",
                  f"лог {C._f(d['logistics'])} · хран {C._f(d['storage'])} · уд {C._f(d['deduction'])}",
                  fmt="General", indent=2)
+
+        wb_by_scheme = wb.get("by_scheme") or {}
+        if wb.get("scheme_split_available") and len(wb_by_scheme) > 1:
+            r += 1
+            r = _row(ws, r, "Разбивка WB по схеме (только продажи/штуки)", "", fmt="General", bold=True, indent=0)
+            for scheme, ds in wb_by_scheme.items():
+                r = _row(ws, r, f"   {scheme} — выкупы", ds["net_units"], fmt=PCS, indent=2)
+                r = _row(ws, r, f"   {scheme} — продажи", ds["sales_rub"], indent=2)
+            r = _row(ws, r, "   ⚠️ примечание",
+                     "удержания (логистика/хранение/реклама) в отчёте реализации WB по схеме не разделены",
+                     fmt="General", indent=2)
+        elif not wb.get("scheme_split_available"):
+            r += 1
+            r = _row(ws, r, "Разбивка WB по схеме", "нет wb_orders.json/wb_sales.json для сопоставления по srid",
+                     fmt="General", indent=0)
 
     r += 1
     # ── ИТОГ ──

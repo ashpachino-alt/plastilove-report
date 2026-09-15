@@ -100,92 +100,126 @@ def wb_post(url: str, token: str, body: dict, pause: bool = True) -> list | dict
 # OZON
 # ──────────────────────────────────────────────
 
-def fetch_ozon_transactions(date_from: str, date_to: str, out: Path):
-    """POST /v3/finance/transaction/list — полная пагинация."""
-    log("OZON: финансовые транзакции")
-
-    # API не принимает период > 1 месяца — разбиваем при необходимости
-    from datetime import date, timedelta
-    d_from = date.fromisoformat(date_from)
-    d_to   = date.fromisoformat(date_to)
-
-    all_ops = []
-    total_pages = 0
-
-    # Разбиваем по месяцам
-    chunk_start = d_from
-    while chunk_start <= d_to:
-        # конец чанка — последний день этого месяца или d_to
-        import calendar
-        last_day = calendar.monthrange(chunk_start.year, chunk_start.month)[1]
-        chunk_end = min(date(chunk_start.year, chunk_start.month, last_day), d_to)
-
-        cf = chunk_start.isoformat() + "T00:00:00Z"
-        ct = chunk_end.isoformat()   + "T23:59:59Z"
-        log(f"  чанк {cf[:10]} — {ct[:10]}")
-
-        page = 1
-        while True:
-            data = ozon_post("/v3/finance/transaction/list", {
-                "filter": {"date": {"from": cf, "to": ct}, "transaction_type": "all"},
-                "page": page,
-                "page_size": 1000,
-            })
-            if "result" not in data:
-                log(f"  ОШИБКА стр {page}: {data}")
-                break
-            page_count = data["result"]["page_count"]
-            ops = data["result"]["operations"]
-            all_ops.extend(ops)
-            total_pages += 1
-            log(f"    стр {page}/{page_count}: {len(ops)} ops, всего: {len(all_ops)}")
-            if page >= page_count:
-                break
-            page += 1
-
-        chunk_start = chunk_end + timedelta(days=1)
-
-    path = save(out, "ozon_transactions.json", all_ops)
-    total_amount = sum(op.get("amount", 0) for op in all_ops)
-
-    MANIFEST["ozon_finance"] = {
-        "file": str(path),
-        "size_bytes": path.stat().st_size,
-        "pages_fetched": total_pages,
-        "operations_count": len(all_ops),
-        "total_amount": round(total_amount, 2),
-    }
-    log(f"  Итого: {len(all_ops)} операций, {total_pages} страниц, сумма={total_amount:,.2f} ₽")
+def _extract_ozon_ops(data):
+    """
+    Гибко достаёт список операций из ответа /v1/finance/cash-flow-statement/list.
+    Точная форма ответа этого метода официально не задокументирована (метод новый,
+    пришёл на замену /v3/finance/transaction/list — см. комментарий к
+    fetch_ozon_finance ниже), поэтому пробуем несколько известных путей.
+    Возвращает список операций, либо None, если ни один путь не подошёл
+    (тогда вызывающий код печатает сырые ключи ответа для диагностики).
+    """
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        candidate_paths = (
+            ("result", "operations"), ("result", "cash_flows"), ("result", "items"),
+            ("result", "rows"), ("result",),
+            ("operations",), ("cash_flows",), ("items",), ("rows",),
+        )
+        for path in candidate_paths:
+            cur = data
+            ok = True
+            for p in path:
+                if isinstance(cur, dict) and p in cur:
+                    cur = cur[p]
+                else:
+                    ok = False
+                    break
+            if ok and isinstance(cur, list):
+                return cur
+    return None
 
 
-def fetch_ozon_transaction_totals(date_from: str, date_to: str, out: Path):
-    """POST /v3/finance/transaction/totals — сверка."""
-    log("OZON: transaction/totals")
+def fetch_ozon_finance(date_from: str, date_to: str, out: Path):
+    """
+    POST /v1/finance/cash-flow-statement/list — начисления и движение денег.
+
+    ⚠️ ВАЖНО: раньше здесь использовались /v3/finance/transaction/list и
+    /v3/finance/transaction/totals. Ozon отключил оба метода 08.09.2026
+    (анонс в @OzonSellerAPI, см. https://dev.ozon.ru/news/699-Novye-metody-dlia-finansovykh-otchetov-v-Seller-API/).
+    Именно это — а не переход продавца на FBO — было причиной нулевых отчётов
+    в сентябре 2026: /v3/finance/transaction/list с этой даты возвращает ошибку,
+    fetch падал, ozon_transactions.json оставался пустым, и весь расчёт уходил в 0.
+
+    Новый метод пока официально не задокументирован в открытом доступе,
+    поэтому распаковка ответа сделана максимально гибко (_extract_ozon_ops).
+    Если Ozon снова поменяет форму ответа — в логе будут видны сырые
+    верхнеуровневые ключи первой же "непонятной" страницы.
+    """
+    log("OZON: движение денег / начисления (cash-flow-statement)")
     from datetime import date, timedelta
     import calendar
 
     d_from = date.fromisoformat(date_from)
     d_to   = date.fromisoformat(date_to)
-    all_totals = []
 
+    all_ops = []
     chunk_start = d_from
     while chunk_start <= d_to:
         last_day = calendar.monthrange(chunk_start.year, chunk_start.month)[1]
         chunk_end = min(date(chunk_start.year, chunk_start.month, last_day), d_to)
-        cf = chunk_start.isoformat() + "T00:00:00Z"
-        ct = chunk_end.isoformat()   + "T23:59:59Z"
-        try:
-            data = ozon_post("/v3/finance/transaction/totals", {
-                "filter": {"date": {"from": cf, "to": ct}, "transaction_type": "all"}
+        cf = chunk_start.isoformat()
+        ct = chunk_end.isoformat()
+        log(f"  чанк {cf} — {ct}")
+
+        page = 1
+        while True:
+            data = ozon_post("/v1/finance/cash-flow-statement/list", {
+                "date": {"from": cf, "to": ct},
+                "with_details": True,
+                "page": page,
+                "page_size": 1000,
             })
-            all_totals.append({"period": f"{cf[:10]}/{ct[:10]}", "data": data})
-            log(f"  totals {cf[:10]}–{ct[:10]}: OK")
-        except Exception as e:
-            log(f"  totals ОШИБКА {cf[:10]}–{ct[:10]}: {e}")
-        from datetime import timedelta
+            ops = _extract_ozon_ops(data)
+            if ops is None:
+                keys = list(data.keys()) if isinstance(data, dict) else str(type(data))
+                log(f"  ⚠️ стр {page}: не нашёл список операций в ответе — верхнеуровневые ключи: {keys}")
+                log(f"     сырой ответ (обрезан): {str(data)[:500]}")
+                break
+            if not ops:
+                break
+            all_ops.extend(ops)
+            log(f"    стр {page}: +{len(ops)}, всего: {len(all_ops)}")
+            if len(ops) < 1000:
+                break
+            page += 1
+
         chunk_start = chunk_end + timedelta(days=1)
 
-    save(out, "ozon_transaction_totals.json", all_totals)
+    path = save(out, "ozon_finance_operations.json", all_ops)
+    total_amount = sum((op.get("amount") or op.get("sum") or 0) for op in all_ops if isinstance(op, dict))
+
+    MANIFEST["ozon_finance"] = {
+        "file": str(path),
+        "size_bytes": path.stat().st_size,
+        "operations_count": len(all_ops),
+        "total_amount": round(total_amount, 2),
+    }
+    log(f"  Итого: {len(all_ops)} операций, сумма≈{total_amount:,.2f} ₽")
+    if not all_ops:
+        log("  ⚠️ операций 0 — либо за период правда нет начислений, либо см. предупреждения выше по форме ответа")
+
+
+def fetch_ozon_realization(month: int, year: int, out: Path):
+    """
+    POST /v2/finance/realization — официальный месячный отчёт о реализации
+    (аналог xlsx «Отчёт по начислениям», который раньше выгружали вручную
+    из личного кабинета). Отдаёт данные только по уже закрытым месяцам,
+    поэтому используется как сверка/задел на будущее для --final закрытия,
+    а не для оперативного дневного отчёта. compute.py пока эти данные
+    не использует напрямую — файл сохраняется для ручной сверки и
+    для последующего расширения расчёта.
+    """
+    log(f"OZON: отчёт о реализации за {month:02d}.{year}")
+    try:
+        data = ozon_post("/v2/finance/realization", {"month": month, "year": year})
+    except Exception as e:
+        log(f"  реализация ОШИБКА: {e}")
+        MANIFEST["ozon_realization"] = {"error": str(e)}
+        return
+    path = save(out, "ozon_realization.json", data)
+    MANIFEST["ozon_realization"] = {"file": str(path), "size_bytes": path.stat().st_size}
 
 
 def fetch_ozon_fbo(date_from: str, date_to: str, out: Path):
@@ -562,8 +596,11 @@ def main():
 
     # ── OZON ──
     log("━━━ OZON ━━━")
-    safe("ozon_finance", fetch_ozon_transactions, args.date_from, args.date_to, out)
-    safe("ozon_totals", fetch_ozon_transaction_totals, args.date_from, args.date_to, out)
+    safe("ozon_finance", fetch_ozon_finance, args.date_from, args.date_to, out)
+
+    if "ozon_realization" not in skip and args.date_from.endswith("-01"):
+        y, m = map(int, args.date_from.split("-")[:2])
+        safe("ozon_realization", fetch_ozon_realization, m, y, out)
 
     if "ozon_fbo" not in skip:
         safe("ozon_postings_fbo", fetch_ozon_fbo, args.date_from, args.date_to, out)
