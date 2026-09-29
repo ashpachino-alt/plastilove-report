@@ -56,7 +56,7 @@ def build_message(res: dict, period: str, asof: str = None) -> str:
     L.append(f"   в т.ч. удержано: реклама {_f(-oz['ads'])} · кросс-докинг {_f(-oz['crossdock'])}")
     L.append(f"• <b>Опт: {oz['opt']:.0f} ₽/шт</b> — {_opt_zone(oz['opt'])}")
     L.append("")
-    L.append(f"− налог 7%: {_f(oz['tax'])} ₽")
+    L.append(f"− налог УСН 6%: {_f(oz['tax'])} ₽ (база по реализации {_f(oz['tax_base'])})")
     L.append(f"− завод: {_f(oz['factory'])} ₽")
     L.append(f"− короб: {_f(oz['pack'])} ₽")
     L.append(f"= до команды: {_f(oz['before_team'])} ₽")

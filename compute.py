@@ -7,7 +7,7 @@ ozon_skumap.json (sku → артикул), ozon_types.json (справочник
 
 Логика (инструкция проекта):
   чистые выкупы → чистые продажи → выплаты Ozon → опт = выплаты / выкупы
-  → − налог 7% (от чистых продаж, «Ваша цена») → − завод (по группам SKU)
+  → − налог УСН 6% (база = «реализовано» + «выплаты от партнёров», как в Отчёте о реализации) → − завод (по группам SKU)
   → − транспортный короб (корпусные SKU) → − команда (оклад 70 000;
   KPI — резерв, в команду только при финальном закрытии) = деньги владельца.
 
@@ -23,17 +23,20 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-TAX_RATE = 0.07
+TAX_RATE = 0.06          # УСН 6% «доходы»: база = Отчёт о реализации Ozon
 OZON_SALARY = 70_000
 BOX_PER_UNIT = 7          # транспортный короб 45 ₽ / 6 компл, только корпусные SKU
-COST_CORPUS = 257         # совместимость со старым run_daily/report
+COST_CORPUS = 250         # совместимость со старым run_daily/report
 
 # Группы SKU: себестоимость, план опта для KPI, короб
 GROUPS = {
     "россыпь": {"cost": 170, "plan": 290, "box": 0},
-    "бежевая": {"cost": 267, "plan": 570, "box": BOX_PER_UNIT},
-    "база":    {"cost": 257, "plan": 550, "box": BOX_PER_UNIT},
+    "бежевая": {"cost": 260, "plan": 575, "box": BOX_PER_UNIT},
+    "база":    {"cost": 250, "plan": 550, "box": BOX_PER_UNIT},
 }
+# Планы опта, отличные от группы (по таблице команды)
+PLAN_OVERRIDE = {"CB-MLK-RMB-4": 570}
+MIN_UNITS, MIN_OPT = 1200, 550
 ROSSYP_OFFERS = {"CBH-BLK-WOD-4"}
 
 # Типы начислений, которые считаем рекламой (справочно, уже внутри выплат)
@@ -86,9 +89,10 @@ def load_raw(raw: Path) -> dict:
 # KPI команды Ozon (зафиксированная формула: план-факт по опту + шкала объёма)
 # ──────────────────────────────────────────────
 def volume_bonus(net_units: int) -> int:
-    if net_units < 1200:
+    """3 000 ₽ за каждые полные 100 шт сверх базы 1 200, без потолка."""
+    if net_units < MIN_UNITS:
         return 0
-    return min(3000 * ((net_units - 1200) // 100 + 1), 15000)
+    return 3000 * ((net_units - MIN_UNITS) // 100)
 
 
 def ozon_kpi(net_sales: float, payout: float, sku_rows: list, net_units: int) -> dict:
@@ -100,20 +104,28 @@ def ozon_kpi(net_sales: float, payout: float, sku_rows: list, net_units: int) ->
         if u <= 0:
             continue
         fact = (r["net_sales"] / u) * (1 - expense_rate)
-        plan = GROUPS[r["group"]]["plan"]
+        plan = PLAN_OVERRIDE.get(r["offer"], GROUPS[r["group"]]["plan"])
         diff = (fact - plan) * u
         diff_total += diff
         lines.append({"offer": r["offer"], "fact": round(fact, 2), "plan": plan,
                       "units": u, "diff": round(diff, 2)})
     opt_raw = 0.5 * diff_total
-    opt_bonus = max(round(opt_raw), 0)
-    vol = volume_bonus(net_units)
+    vol_raw = volume_bonus(net_units)
+    avg_opt = (payout / net_units) if net_units else 0
     reasons = []
-    if net_units < 1200:
-        reasons.append(f"объём {net_units} шт < 1200 — бонус за объём 0")
-    if opt_raw < 0:
+    gate = net_units >= MIN_UNITS and avg_opt >= MIN_OPT
+    if net_units < MIN_UNITS:
+        reasons.append(f"объём {net_units} шт < {MIN_UNITS}")
+    if avg_opt < MIN_OPT:
+        reasons.append(f"средний опт {avg_opt:.0f} ₽ < санитарных {MIN_OPT} ₽")
+    if gate and opt_raw < 0:
         reasons.append(f"опт ниже плана (Σ разница {round(diff_total):,} ₽) — бонус за опт 0".replace(",", " "))
+    opt_bonus = max(round(opt_raw), 0) if gate else 0
+    vol = vol_raw if gate else 0
+    if not gate:
+        reasons.append("KPI не начисляется (нужны оба условия)")
     return {"expense_rate": round(expense_rate, 4), "opt_raw": round(opt_raw, 2),
+            "vol_raw": vol_raw, "diff_total": round(diff_total, 2),
             "opt": opt_bonus, "volume": vol, "total": opt_bonus + vol,
             "by_sku": lines, "reason": "; ".join(reasons) or "KPI начислен по факту"}
 
@@ -128,6 +140,7 @@ def compute_ozon(accruals, skumap=None, types=None, final=False) -> dict:
     tname = lambda t: (types or {}).get(t) or FALLBACK_TYPES.get(t) or f"Тип начисления {t}"
 
     payout = 0.0
+    realized = partners = 0.0   # налоговая база = «реализовано» + «выплаты от партнёров»
     sold_units = ret_units = 0
     gross = ret_sum = 0.0
     lines = defaultdict(float)          # статьи удержаний/начислений
@@ -155,6 +168,8 @@ def compute_ozon(accruals, skumap=None, types=None, final=False) -> dict:
                 if c:
                     sa = _amt(c.get("sale_amount"))
                     com = _amt(c.get("commission"))
+                    realized += _amt(c.get("sale_price"))
+                    partners += _amt(c.get("coinvestment"))
                     if sa > 0:
                         sold_units += q; gross += sa; sku[s]["sold"] += q
                         schemes[sch]["net_units"] += q
@@ -228,7 +243,8 @@ def compute_ozon(accruals, skumap=None, types=None, final=False) -> dict:
         pack += u * cfg["box"]
 
     opt = round(payout / net_units, 2) if net_units else 0
-    tax = round(net_sales * TAX_RATE, 2)
+    tax_base = round(realized + partners, 2)
+    tax = round(tax_base * TAX_RATE, 2)
     kpi = ozon_kpi(net_sales, payout, sku_rows, net_units)
     team = OZON_SALARY + (kpi["total"] if final else 0)
     before_team = round(payout - tax - factory - pack, 2)
@@ -241,7 +257,8 @@ def compute_ozon(accruals, skumap=None, types=None, final=False) -> dict:
         "gross_sales": round(gross, 2), "returns_sum": round(ret_sum, 2),
         "net_sales": net_sales, "payout": payout, "opt": opt,
         "ads": round(ads, 2), "crossdock": round(crossdock, 2),
-        "tax": tax, "factory": factory, "pack": pack,
+        "tax": tax, "tax_base": tax_base, "tax_realized": round(realized, 2),
+        "tax_partners": round(partners, 2), "factory": factory, "pack": pack,
         "salary": OZON_SALARY, "kpi": kpi, "kpi_in_team": final, "team": team,
         "before_team": before_team, "owner": owner,
         "unit_profit": round(owner / net_units, 2) if net_units else 0,
@@ -271,7 +288,7 @@ def print_report(res: dict):
     print(f"  чистые продажи:  {_f(oz['net_sales'])} ₽")
     print(f"  выплаты Ozon:    {_f(oz['payout'])} ₽  (реклама внутри: {_f(-oz['ads'])} ₽, кросс-докинг: {_f(-oz['crossdock'])} ₽)")
     print(f"  ОПТ:             {oz['opt']:.2f} ₽/шт")
-    print(f"  − налог 7%:      {_f(oz['tax'])} ₽")
+    print(f"  − налог УСН 6%:  {_f(oz['tax'])} ₽  (база {_f(oz['tax_base'])} = реализовано {_f(oz['tax_realized'])} + партнёры {_f(oz['tax_partners'])})")
     print(f"  − завод:         {_f(oz['factory'])} ₽  " +
           " · ".join(f"{g} {d['net_units']}×{d['cost']}" for g, d in oz["groups"].items()))
     print(f"  − короб:         {_f(oz['pack'])} ₽")

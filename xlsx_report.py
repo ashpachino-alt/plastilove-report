@@ -88,7 +88,9 @@ def build(res: dict, period: str, out_path: Path, asof: str = None):
         r = _row(ws, r, "   справочно: реклама внутри выплат", oz["ads"], indent=2)
         r = _row(ws, r, "   справочно: кросс-докинг внутри выплат", oz["crossdock"], indent=2)
         r = _row(ws, r, "Опт (выплаты / чистые выкупы)", oz["opt"], RUBU, bold=True)
-        r = _row(ws, r, "− Налог 7% от чистых продаж", -oz["tax"])
+        r = _row(ws, r, "Налоговая база: реализовано за вычетом возвратов", oz["tax_realized"], indent=2)
+        r = _row(ws, r, "Налоговая база: выплаты от партнёров", oz["tax_partners"], indent=2)
+        r = _row(ws, r, "− Налог УСН 6% от базы по реализации", -oz["tax"])
         for g, d in oz["groups"].items():
             r = _row(ws, r, f"− Завод: {g} ({d['net_units']} × {d['cost']} ₽)", -d["factory"])
         r = _row(ws, r, "− Транспортный короб (7 ₽/шт, корпусные)", -oz["pack"])
@@ -103,7 +105,7 @@ def build(res: dict, period: str, out_path: Path, asof: str = None):
         r = _row(ws, r, "Прибыль владельца на 1 шт", oz["unit_profit"], RUBU)
         r += 1
         r = _section(ws, r, "ОБЯЗАТЕЛЬСТВА")
-        r = _row(ws, r, "Долг налоговой (7%)", oz["tax"])
+        r = _row(ws, r, "Долг налоговой (УСН 6%)", oz["tax"])
         r = _row(ws, r, "Долг заводу", oz["factory"])
 
         # По SKU
