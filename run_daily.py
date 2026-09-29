@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-run_daily.py — ежедневный автоматический прогон: fetch → compute → Excel → Telegram.
-Запускается по расписанию в 9:00 (см. deploy/ниже). Период = текущий календарный месяц (1 → сегодня).
+run_daily.py — ежедневный прогон: Ozon fetch → compute → Excel → Telegram.
 
-Использование:
-  python run_daily.py                       # текущий месяц, оперативный
-  python run_daily.py --period 2026-06      # конкретный месяц (для пересчёта вручную)
-  python run_daily.py --final               # финальное закрытие (KPI Ozon в команду)
-  python run_daily.py --skip-fetch          # не тянуть заново, считать по уже скачанному сырью
+По умолчанию: текущий месяц, 1-е число → сегодня (оперативный).
+1-го числа: предыдущий месяц целиком (финальный, KPI в команде).
 
-.env: ключи Ozon/WB (для fetch) + TG_BOT_TOKEN / TG_CHAT_ID (+ опц. CROSS_DOCK, COST).
+  python run_daily.py                    # по расписанию
+  python run_daily.py --period 2026-08 --final
+  python run_daily.py --no-send          # превью без отправки
 """
 
 import argparse
 import calendar
 import subprocess
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import compute as C
@@ -27,79 +25,64 @@ BASE = Path(__file__).resolve().parent
 
 
 def month_bounds(period: str | None):
+    today = date.today()
     if period:
         y, m = map(int, period.split("-"))
-        d_from = date(y, m, 1)
-        # если это текущий месяц — до сегодня, иначе — до конца месяца
-        today = date.today()
-        if (y, m) == (today.year, today.month):
-            d_to = today
-        else:
-            d_to = date(y, m, calendar.monthrange(y, m)[1])
+    elif today.day == 1:
+        prev = today - timedelta(days=1)
+        y, m = prev.year, prev.month
     else:
-        today = date.today()
         y, m = today.year, today.month
-        d_from = date(y, m, 1)
-        d_to = today
-    return f"{y:04d}-{m:02d}", d_from.isoformat(), d_to.isoformat()
+    last = date(y, m, calendar.monthrange(y, m)[1])
+    d_to = min(last, today)
+    return f"{y:04d}-{m:02d}", date(y, m, 1).isoformat(), d_to.isoformat(), d_to == last and today > last
 
 
-def run_fetch(date_from: str, date_to: str, out: Path, skip: list[str] | None = None):
-    print(f"[daily] fetch {date_from} → {date_to} → {out}")
-    cmd = [sys.executable, str(BASE / "fetch.py"),
-           "--from", date_from, "--to", date_to, "--out", str(out)]
-    if skip:
-        cmd += ["--skip", *skip]
-    # НЕ роняем весь пайплайн, если fetch вернул ненулевой код:
-    # отчёт всё равно соберётся, если критичные файлы (транзакции Ozon,
-    # реализация WB) успели скачаться. Ниже compute сам проверит наличие данных.
-    r = subprocess.run(cmd, check=False)
-    if r.returncode != 0:
-        print(f"[daily] ⚠️ fetch завершился с кодом {r.returncode} — считаю по тому, что успело скачаться")
+def alert(text: str, no_send: bool):
+    print(text)
+    if not no_send:
+        try:
+            R.send_telegram(text)
+        except Exception as e:
+            print(f"не удалось отправить алерт: {e}")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--period", help="YYYY-MM (по умолчанию текущий месяц)")
-    ap.add_argument("--cost", type=int, default=C.COST_CORPUS)
-    ap.add_argument("--cross-dock", type=float, default=None,
-                    help="Кросс-докинг WB, ₽ (или из env CROSS_DOCK)")
+    ap.add_argument("--period")
     ap.add_argument("--final", action="store_true")
-    ap.add_argument("--skip-fetch", action="store_true", help="Не тянуть сырьё заново")
-    ap.add_argument("--no-send", action="store_true", help="Не отправлять в Telegram (тест)")
-    ap.add_argument("--skip", nargs="*", default=[],
-                    help="Источники для пропуска в fetch.py (напр. wb_sales wb_orders wb_report wb_stocks)")
-    args = ap.parse_args()
+    ap.add_argument("--skip-fetch", action="store_true")
+    ap.add_argument("--no-send", action="store_true")
+    args, _unknown = ap.parse_known_args()   # старые флаги (--cost, --cross-dock) игнорируем
 
-    import os
-    from dotenv import load_dotenv
-    load_dotenv(BASE / ".env")
-
-    cross = args.cross_dock if args.cross_dock is not None else float(os.getenv("CROSS_DOCK", "0"))
-
-    period, d_from, d_to = month_bounds(args.period)
+    period, d_from, d_to, month_closed = month_bounds(args.period)
+    final = args.final or (month_closed and not args.period)
     raw = BASE / "raw" / period
 
-    # 1) FETCH
     if not args.skip_fetch:
-        run_fetch(d_from, d_to, raw, skip=args.skip)
-    else:
-        print(f"[daily] fetch пропущен, считаю по {raw}")
+        print(f"[daily] fetch {d_from} → {d_to}")
+        r = subprocess.run([sys.executable, str(BASE / "fetch.py"), "--from", d_from,
+                            "--to", d_to, "--out", str(raw)], capture_output=True, text=True)
+        print(r.stdout[-5000:], r.stderr[-3000:])
+        if r.returncode != 0:
+            tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
+            alert("❌ <b>PlastiLove: отчёт Ozon не сформирован</b>\nОшибка выгрузки данных Ozon:\n"
+                  + "\n".join(tail)[:1500], args.no_send)
+            sys.exit(1)
 
-    # 2) COMPUTE
-    res = C.compute_all(raw, cost=args.cost, cross_dock=cross, final=args.final)
+    res = C.compute_all(raw, final=final)
     C.print_report(res)
+    oz = res["ozon"]
+    if "error" in oz or oz.get("accruals_count", 0) == 0:
+        alert(f"⚠️ <b>PlastiLove: нет данных Ozon за {d_from} – {d_to}</b>\n"
+              f"{oz.get('error', 'Ozon вернул 0 начислений')}. Отчёт с нулями не отправляю.", args.no_send)
+        sys.exit(1)
 
-    # 3) EXCEL → reports/<period>/
     xlsx_path = BASE / X.out_path_for(period)
     X.build(res, period, xlsx_path, asof=d_to)
-    print(f"[daily] Excel: {xlsx_path}")
-
-    # 4) TELEGRAM
     msg = R.build_message(res, period, asof=d_to)
     if args.no_send:
-        print("─── превью (не отправлено) ───")
-        print(msg)
+        print("─── превью ───\n" + msg)
     else:
         R.send_telegram(msg, xlsx_path)
         print("[daily] ✓ отправлено в Telegram")

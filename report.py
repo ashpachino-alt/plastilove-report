@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
 """
-report.py — собирает красивое сообщение отчёта и отправляет в Telegram.
+report.py — сообщение отчёта (только Ozon) и отправка в Telegram.
 
-Использование:
-  python report.py --raw ./raw/2026-06 --period 2026-06            # печать превью (не отправляет)
-  python report.py --raw ./raw/2026-06 --period 2026-06 --send     # отправить в Telegram
-  python report.py --raw ./raw/2026-06 --period 2026-06 --send --xlsx reports/2026-06/Отчёт_Июнь_2026.xlsx
-
-.env:
-  TG_BOT_TOKEN=123456:ABC...        (создать у @BotFather)
-  TG_CHAT_ID=123456789              (свой chat_id, узнать у @userinfobot)
+  python report.py --raw raw/2026-09 --period 2026-09            # превью
+  python report.py --raw raw/2026-09 --period 2026-09 --send     # отправить
 """
 
 import argparse
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -22,142 +17,110 @@ from dotenv import load_dotenv
 import compute as C
 from xlsx_report import RU_MONTHS
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+_f = C._f
 
 
-def _f(x):
-    return f"{round(x):,}".replace(",", " ")
+def _opt_zone(opt: float) -> str:
+    if opt >= 570:
+        return "рабочая зона ✅"
+    if opt >= 550:
+        return "у нижней границы 550–570 ⚠️"
+    return "ниже санитарных 550 ❌"
 
 
 def build_message(res: dict, period: str, asof: str = None) -> str:
-    from datetime import datetime, timezone, timedelta
     y, m = map(int, period.split("-"))
-    title = f"{RU_MONTHS[m]} {y}"
-    oz, wb, t = res["ozon"], res["wb"], res["total"]
+    oz = res["ozon"]
     final = res["params"]["final"]
-    status = "✅ финальный" if final else "🟡 предварительный"
-
-    # Дата отчёта: период (1-е число → asof) и момент формирования (МСК)
     msk = timezone(timedelta(hours=3))
-    now_msk = datetime.now(msk)
+    L = [f"📊 <b>PlastiLove · Ozon · {RU_MONTHS[m]} {y}</b>",
+         f"<i>{'✅ финальный' if final else '🟡 оперативный'}</i>"]
     if asof:
         ay, am, ad = map(int, asof.split("-"))
-        period_line = f"📅 Данные за {1:02d}.{am:02d}–{ad:02d}.{am:02d}.{ay}"
+        L.append(f"📅 Данные за 01.{am:02d}–{ad:02d}.{am:02d}.{ay} (по дате начисления Ozon)")
+    L.append(f"🕘 Сформирован: {datetime.now(msk):%d.%m.%Y %H:%M} МСК")
+    L.append("")
+
+    if "error" in oz:
+        L.append(f"❌ {oz['error']}")
+        return "\n".join(L)
+
+    icon = "🟢" if oz["owner"] >= 0 else "🔴"
+    L.append(f"{icon} <b>Деньги владельца: {_f(oz['owner'])} ₽</b> ({_f(oz['unit_profit'])} ₽/шт)")
+    L.append("")
+    L.append(f"• Выкупы: {oz['sold_units']} − возвраты {oz['returns_units']} = <b>{oz['net_units']} шт</b>")
+    L.append(f"• Чистые продажи: {_f(oz['net_sales'])} ₽")
+    L.append(f"• Выплаты Ozon: {_f(oz['payout'])} ₽")
+    L.append(f"   в т.ч. удержано: реклама {_f(-oz['ads'])} · кросс-докинг {_f(-oz['crossdock'])}")
+    L.append(f"• <b>Опт: {oz['opt']:.0f} ₽/шт</b> — {_opt_zone(oz['opt'])}")
+    L.append("")
+    L.append(f"− налог 7%: {_f(oz['tax'])} ₽")
+    L.append(f"− завод: {_f(oz['factory'])} ₽")
+    L.append(f"− короб: {_f(oz['pack'])} ₽")
+    L.append(f"= до команды: {_f(oz['before_team'])} ₽")
+    kpi = oz["kpi"]
+    if final:
+        L.append(f"− команда: {_f(oz['team'])} ₽ (оклад 70 000 + KPI {_f(kpi['total'])})")
     else:
-        period_line = f"📅 Данные за {title}"
-    gen_line = f"🕘 Сформирован: {now_msk:%d.%m.%Y %H:%M} МСК"
-
-    L = []
-    L.append(f"📊 <b>Отчёт PlastiLove — {title}</b>")
-    L.append(f"<i>{status}</i>")
-    L.append(period_line)
-    L.append(gen_line)
+        L.append(f"− команда: {_f(oz['team'])} ₽ (оклад)")
+        L.append(f"   KPI резерв: {_f(kpi['total'])} ₽ (опт {_f(kpi['opt'])} + объём {_f(kpi['volume'])})")
     L.append("")
+    L.append(f"💸 Долг налоговой: {_f(oz['tax'])} ₽ · заводу: {_f(oz['factory'])} ₽")
 
-    # Итог первым делом — деньги владельца
-    owner = t["owner"]
-    icon = "🟢" if owner >= 0 else "🔴"
-    L.append(f"{icon} <b>Деньги владельца: {_f(owner)} ₽</b>")
-    L.append(f"Выкупы: {_f(t['net_units'])} шт · Продажи: {_f(t['net_sales'])} ₽")
+    top = [r for r in oz["by_sku"] if r["net_units"] > 0][:5]
+    if top:
+        L.append("")
+        L.append("<b>Топ SKU</b> (шт · опт):")
+        for r in top:
+            L.append(f"   {r['offer']}: {r['net_units']} · {r['opt']:.0f} ₽")
+
     L.append("")
-
-    # OZON
-    if "error" not in oz:
-        oi = "🟢" if oz["owner"] >= 0 else "🔴"
-        L.append(f"<b>🟦 OZON</b>  {oi} {_f(oz['owner'])} ₽")
-        L.append(f"• выкупы {oz['net_units']} шт · опт <b>{oz['opt']:.0f} ₽/шт</b>")
-        L.append(f"• выплаты {_f(oz['payout'])} · налог −{_f(oz['tax'])} · завод −{_f(oz['factory'])}")
-        kpi = oz["kpi"]["total"]
-        kpi_word = "в команде" if final else "резерв"
-        L.append(f"• команда {_f(oz['team'])} (KPI {kpi_word}: {_f(kpi)} ₽)")
-        by_scheme = oz.get("by_scheme") or {}
-        if len(by_scheme) > 1:
-            L.append("• по схемам:")
-            for scheme, d in by_scheme.items():
-                L.append(f"   ⁃ {scheme}: {d['net_units']} шт · продажи {_f(d['net_sales'])} · выплаты {_f(d['payout'])} · опт {d['opt']:.0f} ₽/шт")
-        if oz.get("unmatched_note"):
-            L.append(f"• ⚠️ {oz['unmatched_note']}")
-        L.append("")
-
-    # WB
-    if "error" not in wb:
-        wi = "🟢" if wb["owner"] >= 0 else "🔴"
-        L.append(f"<b>🟪 WILDBERRIES</b>  {wi} {_f(wb['owner'])} ₽")
-        L.append(f"• выкупы {wb['net_units']} шт · опт <b>{wb['opt']:.0f} ₽/шт</b>")
-        L.append(f"• выплаты {_f(wb['payout'])} · реклама −{_f(wb['adv'])}")
-        d = wb["deductions"]
-        L.append(f"• логистика −{_f(d['logistics'])} · хранение −{_f(d['storage'])}")
-        wb_by_scheme = wb.get("by_scheme") or {}
-        if wb.get("scheme_split_available") and len(wb_by_scheme) > 1:
-            L.append("• по схемам (продажи/штуки, без разбивки удержаний):")
-            for scheme, ds in wb_by_scheme.items():
-                L.append(f"   ⁃ {scheme}: {ds['net_units']} шт · продажи {_f(ds['sales_rub'])} ₽")
-        if wb["cross_dock_missing"]:
-            L.append("• ⚠️ кросс-докинг не передан (в расчёте 0)")
-        L.append("")
-
-    # Долги
-    L.append(f"💸 Долг налоговой: {_f(t['debt_tax'])} ₽ · заводу: {_f(t['debt_factory'])} ₽")
-
-    # Короткий вердикт
-    if "error" not in oz and "error" not in wb:
-        winner = "Ozon" if oz["owner"] >= wb["owner"] else "WB"
-        L.append("")
-        verdict = f"Месяц сделал <b>{winner}</b>."
-        if wb["owner"] < 0:
-            verdict += " WB в минусе — логистика/хранение на перезатаре; разгружать склад, рекламу резать."
-        L.append(verdict)
-
+    notes = []
+    if oz["unit_profit"] < 150:
+        notes.append(f"прибыль {oz['unit_profit']:.0f} ₽/шт ниже ориентира 150")
+    if oz["opt"] < 550:
+        notes.append("опт ниже 550 — проверить рекламу и цены")
+    if kpi["reason"] != "KPI начислен по факту":
+        notes.append(f"KPI: {kpi['reason']}")
+    if notes:
+        L.append("⚠️ " + "; ".join(notes))
     return "\n".join(L)
 
 
 def send_telegram(text: str, xlsx: Path | None = None) -> dict:
-    token = os.getenv("TG_BOT_TOKEN")
-    chat  = os.getenv("TG_CHAT_ID")
+    token, chat = os.getenv("TG_BOT_TOKEN"), os.getenv("TG_CHAT_ID")
     if not token or not chat:
-        raise SystemExit("ERROR: TG_BOT_TOKEN / TG_CHAT_ID не найдены в .env")
-
+        raise SystemExit("ERROR: TG_BOT_TOKEN / TG_CHAT_ID не заданы")
     api = f"https://api.telegram.org/bot{token}"
-    # 1) текст
     r = requests.post(f"{api}/sendMessage", json={
-        "chat_id": chat, "text": text, "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }, timeout=30)
+        "chat_id": chat, "text": text[:4000], "parse_mode": "HTML",
+        "disable_web_page_preview": True}, timeout=30)
     r.raise_for_status()
-    res = r.json()
-    # 2) Excel-файл (если есть)
     if xlsx and Path(xlsx).exists():
         with open(xlsx, "rb") as f:
-            rd = requests.post(f"{api}/sendDocument", data={"chat_id": chat},
-                               files={"document": f}, timeout=120)
-        rd.raise_for_status()
-    return res
+            requests.post(f"{api}/sendDocument", data={"chat_id": chat},
+                          files={"document": f}, timeout=120).raise_for_status()
+    return r.json()
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Отчёт PlastiLove в Telegram")
+    ap = argparse.ArgumentParser()
     ap.add_argument("--raw", required=True)
-    ap.add_argument("--period", required=True, help="YYYY-MM")
-    ap.add_argument("--cost", type=int, default=C.COST_CORPUS)
-    ap.add_argument("--cross-dock", type=float, default=0)
+    ap.add_argument("--period", required=True)
     ap.add_argument("--final", action="store_true")
-    ap.add_argument("--send", action="store_true", help="Отправить в Telegram (иначе только печать)")
-    ap.add_argument("--xlsx", help="Приложить Excel-файл к сообщению")
-    ap.add_argument("--asof", help="Дата данных YYYY-MM-DD (по умолчанию сегодня)")
-    args = ap.parse_args()
-
-    asof = args.asof or __import__("datetime").date.today().isoformat()
-    res = C.compute_all(args.raw, cost=args.cost, cross_dock=args.cross_dock, final=args.final)
-    msg = build_message(res, args.period, asof=asof)
-
-    if args.send:
-        send_telegram(msg, Path(args.xlsx) if args.xlsx else None)
+    ap.add_argument("--send", action="store_true")
+    ap.add_argument("--xlsx")
+    ap.add_argument("--asof")
+    a = ap.parse_args()
+    res = C.compute_all(a.raw, final=a.final)
+    msg = build_message(res, a.period, asof=a.asof)
+    if a.send:
+        send_telegram(msg, Path(a.xlsx) if a.xlsx else None)
         print("✓ Отправлено в Telegram")
     else:
-        print("─── ПРЕВЬЮ TELEGRAM (HTML) ───")
         print(msg)
-        print("──────────────────────────────")
-        print("Для отправки добавь --send (нужны TG_BOT_TOKEN и TG_CHAT_ID в .env)")
 
 
 if __name__ == "__main__":
