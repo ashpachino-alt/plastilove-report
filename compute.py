@@ -111,19 +111,15 @@ def ozon_kpi(net_sales: float, payout: float, sku_rows: list, net_units: int) ->
                       "units": u, "diff": round(diff, 2)})
     opt_raw = 0.5 * diff_total
     vol_raw = volume_bonus(net_units)
-    avg_opt = (payout / net_units) if net_units else 0
     reasons = []
-    gate = net_units >= MIN_UNITS and avg_opt >= MIN_OPT
+    # Две независимые оси: объём платится от 1 200 шт при любом опте,
+    # опт-бонус — только если Σ разницы факт−план положительная (в минус не уходит).
     if net_units < MIN_UNITS:
-        reasons.append(f"объём {net_units} шт < {MIN_UNITS}")
-    if avg_opt < MIN_OPT:
-        reasons.append(f"средний опт {avg_opt:.0f} ₽ < санитарных {MIN_OPT} ₽")
-    if gate and opt_raw < 0:
+        reasons.append(f"объём {net_units} шт < {MIN_UNITS} — бонус за объём 0")
+    if opt_raw < 0:
         reasons.append(f"опт ниже плана (Σ разница {round(diff_total):,} ₽) — бонус за опт 0".replace(",", " "))
-    opt_bonus = max(round(opt_raw), 0) if gate else 0
-    vol = vol_raw if gate else 0
-    if not gate:
-        reasons.append("KPI не начисляется (нужны оба условия)")
+    opt_bonus = max(round(opt_raw), 0)
+    vol = vol_raw
     return {"expense_rate": round(expense_rate, 4), "opt_raw": round(opt_raw, 2),
             "vol_raw": vol_raw, "diff_total": round(diff_total, 2),
             "opt": opt_bonus, "volume": vol, "total": opt_bonus + vol,
