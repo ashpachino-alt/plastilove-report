@@ -12,6 +12,7 @@ run_daily.py — ежедневный прогон: Ozon fetch → compute → E
 
 import argparse
 import calendar
+import html
 import subprocess
 import sys
 from datetime import date, timedelta
@@ -67,7 +68,7 @@ def main():
         if r.returncode != 0:
             tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
             alert("❌ <b>PlastiLove: отчёт Ozon не сформирован</b>\nОшибка выгрузки данных Ozon:\n"
-                  + "\n".join(tail)[:1500], args.no_send)
+                  + html.escape("\n".join(tail)[:1500]), args.no_send)
             sys.exit(1)
 
     res = C.compute_all(raw, final=final)
@@ -75,7 +76,7 @@ def main():
     oz = res["ozon"]
     if "error" in oz or oz.get("accruals_count", 0) == 0:
         alert(f"⚠️ <b>PlastiLove: нет данных Ozon за {d_from} – {d_to}</b>\n"
-              f"{oz.get('error', 'Ozon вернул 0 начислений')}. Отчёт с нулями не отправляю.", args.no_send)
+              f"{html.escape(oz.get('error', 'Ozon вернул 0 начислений'))}. Отчёт с нулями не отправляю.", args.no_send)
         sys.exit(1)
 
     xlsx_path = BASE / X.out_path_for(period)

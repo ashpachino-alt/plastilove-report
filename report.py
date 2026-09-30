@@ -7,7 +7,9 @@ report.py — сообщение отчёта (только Ozon) и отпра�
 """
 
 import argparse
+import html
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -44,7 +46,7 @@ def build_message(res: dict, period: str, asof: str = None) -> str:
     L.append("")
 
     if "error" in oz:
-        L.append(f"❌ {oz['error']}")
+        L.append(f"❌ {html.escape(oz['error'])}")
         return "\n".join(L)
 
     icon = "🟢" if oz["owner"] >= 0 else "🔴"
@@ -85,7 +87,7 @@ def build_message(res: dict, period: str, asof: str = None) -> str:
     if kpi["reason"] != "KPI начислен по факту":
         notes.append(f"KPI: {kpi['reason']}")
     if notes:
-        L.append("⚠️ " + "; ".join(notes))
+        L.append("⚠️ " + html.escape("; ".join(notes)))
     return "\n".join(L)
 
 
@@ -97,7 +99,14 @@ def send_telegram(text: str, xlsx: Path | None = None) -> dict:
     r = requests.post(f"{api}/sendMessage", json={
         "chat_id": chat, "text": text[:4000], "parse_mode": "HTML",
         "disable_web_page_preview": True}, timeout=30)
-    r.raise_for_status()
+    if r.status_code == 400:
+        # ошибка HTML-разметки — не теряем отчёт, шлём простым текстом
+        print(f"Telegram HTML отклонён: {r.text[:300]} — отправляю без разметки")
+        plain = html.unescape(re.sub(r"</?[bi]>", "", text))
+        r = requests.post(f"{api}/sendMessage", json={
+            "chat_id": chat, "text": plain[:4000], "disable_web_page_preview": True}, timeout=30)
+    if not r.ok:
+        raise RuntimeError(f"Telegram sendMessage {r.status_code}: {r.text[:300]}")
     if xlsx and Path(xlsx).exists():
         with open(xlsx, "rb") as f:
             requests.post(f"{api}/sendDocument", data={"chat_id": chat},
